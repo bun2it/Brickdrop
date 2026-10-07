@@ -195,10 +195,24 @@ void App::pumpLsQueues() {
     m_activePrompt = m_activeReq.sessionId;
     m_lastPromptMs = SDL_GetTicks();
   }
+  // Test hook: BRICKDROP_AUTOAPPROVE=1 tự duyệt sau 2s (test E2E qua adb).
+  std::string autoSid;
+  if (!m_activePrompt.empty() && getenv("BRICKDROP_AUTOAPPROVE")) {
+    if (SDL_GetTicks() - m_lastPromptMs > 2000) {
+      autoSid = m_activePrompt;
+      m_activePrompt.clear();
+    }
+  }
   // Timeout 60s không duyệt -> coi như bỏ qua modal (service tự timeout 408).
   if (!m_activePrompt.empty() && SDL_GetTicks() - m_lastPromptMs > 60000) {
     LocalSendManager::instance().rejectUpload(m_activePrompt);
     m_activePrompt.clear();
+  }
+  if (!autoSid.empty()) {
+    LocalSendManager::instance().approveUploadWithPath(
+        autoSid, Config::instance().saveDir());
+    toast("Tự duyệt (autotest)");
+    setScreen(Screen::PROGRESS);
   }
 }
 
