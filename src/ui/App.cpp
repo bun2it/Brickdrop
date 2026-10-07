@@ -566,7 +566,7 @@ void App::renderSendDevices() {
 void App::renderRecvDir() {
   header("Thư mục nhận file", trunc(m_recvLs.path(), m_fSmall, 500));
   const auto &es = m_recvLs.entries();
-  int y0 = 90, rh = 56, vis = 9;
+  int y0 = 90, rh = 56, vis = 8;
   if (m_recvLs.selected() < m_scroll)
     m_scroll = m_recvLs.selected();
   if (m_recvLs.selected() >= m_scroll + vis)
@@ -584,6 +584,12 @@ void App::renderRecvDir() {
   if (es.empty())
     drawText("(trống — Y để chốt chính thư mục này)", W / 2, 300, C_DIM,
              m_fMain, true);
+  // Dòng path cố định: nơi nhận đã chốt (không mất khi hết toast).
+  std::string saved = Config::instance().saveDir();
+  bool here = (m_recvLs.path() == saved);
+  std::string line = "Thư mục nhận file: " + saved + (here ? "  (đang ở đây)" : "");
+  drawText(trunc(line, m_fSmall, W - 120), 60, H - FTR - 36, here ? C_OK : C_DIM,
+           m_fSmall);
   footer({{"A", "Vào"}, {"Y", "Chốt nơi nhận"}, {"X", "Tạo thư mục"}, {"B", "Về"}});
 }
 
