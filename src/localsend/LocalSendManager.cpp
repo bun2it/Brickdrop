@@ -2,12 +2,8 @@
 // Xem LocalSendManager.h để hiểu kiến trúc.
 
 #include "LocalSendManager.h"
-#include "../config/AppConfig.h"
-#include "../database/DatabaseManager.h"
-#include "../database/RomIndexer.h"
-#include "../logging/Logger.h"
-#include "../rom/RomOrganizer.h"
-#include "../ui/UIManager.h"
+#include "../core/Config.h"
+#include "../core/Logger.h"
 
 #include <algorithm>
 #include <curl/curl.h>
@@ -35,7 +31,7 @@
 #include <thread>
 #include <unistd.h>
 
-namespace RomCloud {
+namespace BrickDrop {
 
 static inline void closeSocket(int fd) {
   if (fd < 0) return;
@@ -64,13 +60,13 @@ bool LocalSendManager::start() {
     return true; // already running
 
   // 1. Load fingerprint (persist từ /mnt/SDCARD/.romcloud/localsend_fp)
-  m_selfFingerprint = AppConfig::instance().getOrCreateLocalSendFingerprint();
+  m_selfFingerprint = Config::instance().fingerprint();
 
   // 2. Alias
-  m_selfAlias = AppConfig::instance().getLocalSendAlias();
+  m_selfAlias = Config::instance().alias();
 
   // 3. Lấy IP wlan0
-  m_ownIp = LsUtil::getOwnIp("wlan0");
+  m_ownIp = LsUtil::getOwnIp(Config::instance().netInterface());
   if (m_ownIp.empty())
     m_ownIp = "0.0.0.0";
 
@@ -373,6 +369,8 @@ std::string getOwnIp(const std::string &iface) {
   return out;
 }
 
+const std::string& sdRoot() { return Config::instance().sdRoot(); }
+
 bool mkdirRecursive(const std::string &path, mode_t mode) {
   std::string accum;
   bool ok = true;
@@ -425,7 +423,7 @@ std::string humanSize(uint64_t bytes) {
 std::string humanSpeed(uint32_t bps) { return humanSize(bps) + "/s"; }
 
 bool isPathSafe(const std::string &absPath) {
-  const std::string root = "/mnt/SDCARD";
+  const std::string root = sdRoot();
   if (absPath.compare(0, root.size(), root) != 0)
     return false;
   // Phải là đúng root hoặc root + '/' (tránh /mnt/SDCARDEvil)
@@ -1314,7 +1312,7 @@ void LocalSendManager::handleFileUpload(
 
   // Check dung lượng trống trước khi ghi (tránh đầy thẻ giữa chừng)
   if (wantSize > 0) {
-    uint64_t freeB = LsUtil::sdFreeBytes("/mnt/SDCARD");
+    uint64_t freeB = LsUtil::sdFreeBytes(Config::instance().sdRoot());
     if (freeB < wantSize) {
       Logger::warn("LocalSend: not enough space for " + wantName + " need=" +
                    std::to_string(wantSize) + " free=" + std::to_string(freeB));
@@ -1745,7 +1743,7 @@ LocalSendManager::setPendingTargetFolder(const std::string &sessionId,
     target = resolveTargetPath(fm);
   } else {
     std::string s = folderRel;
-    const std::string root = "/mnt/SDCARD";
+    const std::string root = LsUtil::sdRoot();
     if (s.compare(0, root.size(), root) == 0)
       s = s.substr(root.size());
     std::string out, seg;
@@ -1773,7 +1771,7 @@ LocalSendManager::setPendingTargetFolder(const std::string &sessionId,
     if (!out.empty() && out.back() != '/')
       out += '/';
     if (!out.empty())
-      target = "/mnt/SDCARD/" + out + base;
+      target = LsUtil::sdRoot() + "/" + out + base;
   }
   if (target.empty() || !LsUtil::isPathSafe(target))
     return "";
@@ -1808,7 +1806,7 @@ std::string LocalSendManager::resolveTargetPath(const LsFileMeta &file) {
   // Chuẩn hoá 1 đoạn path tương đối: bỏ prefix /mnt/SDCARD, collapse '//',
   // loại bỏ '.' / '..', trim '/' đầu, giữ '/' cuối cho dir.
   auto normalizeRel = [](std::string s, bool isDir) -> std::string {
-    const std::string root = "/mnt/SDCARD";
+    const std::string root = LsUtil::sdRoot();
     if (s.compare(0, root.size(), root) == 0)
       s = s.substr(root.size());
     std::string out;
@@ -1847,7 +1845,7 @@ std::string LocalSendManager::resolveTargetPath(const LsFileMeta &file) {
     if (!m_targetFolder.empty()) {
       std::string dir = normalizeRel(m_targetFolder, true);
       if (!dir.empty())
-        target = "/mnt/SDCARD/" + dir + base;
+        target = LsUtil::sdRoot() + "/" + dir + base;
     }
   }
 
@@ -1855,16 +1853,16 @@ std::string LocalSendManager::resolveTargetPath(const LsFileMeta &file) {
   if (target.empty() && !file.relativePath.empty()) {
     std::string dir = normalizeRel(file.relativePath, true);
     if (!dir.empty())
-      target = "/mnt/SDCARD/" + dir + base;
+      target = LsUtil::sdRoot() + "/" + dir + base;
     else
-      target = "/mnt/SDCARD/Inbox/" + base;
+      target = LsUtil::sdRoot() + "/Inbox/" + base;
   }
 
   // Tier 3: fileName có '/' (sender encode path vào fileName)
   if (target.empty() && file.fileName.find('/') != std::string::npos) {
     std::string rel = normalizeRel(file.fileName, false);
     if (!rel.empty())
-      target = "/mnt/SDCARD/" + rel;
+      target = LsUtil::sdRoot() + "/" + rel;
   }
 
   // Tier 4: heuristic mapping
@@ -1941,14 +1939,14 @@ std::string LocalSendManager::heuristicMap(const std::string &fileName) {
 
   for (const auto &rule : rules) {
     if (rule.exts.size() == 0) { // default
-      return std::string("/mnt/SDCARD/") + rule.dir + base;
+      return LsUtil::sdRoot() + "/" + rule.dir + base;
     }
     for (auto e : rule.exts) {
       if (ext == e)
-        return std::string("/mnt/SDCARD/") + rule.dir + base;
+        return LsUtil::sdRoot() + "/" + rule.dir + base;
     }
   }
-  return "/mnt/SDCARD/Inbox/" + base;
+  return LsUtil::sdRoot() + "/Inbox/" + base;
 }
 
 // =============================================================
@@ -1956,82 +1954,23 @@ std::string LocalSendManager::heuristicMap(const std::string &fileName) {
 // Chạy detached thread (không block HTTP response).
 // =============================================================
 void LocalSendManager::postProcessUpload(const LsUploadRequest &req) {
+  // BrickDrop: giu file tai savedPath, tu bung .zip. Khong DB/index/organize.
   if (req.state != LsUploadRequest::DONE)
     return;
   if (req.savedPath.empty())
     return;
-
-  Logger::info("LocalSend: postProcess " + req.savedPath);
-
-  std::string ext = LsUtil::lowerExt(req.savedPath);
-
-  // 1. Extract .zip vào Inbox/ (RomOrganizer sẽ lo tiếp)
-  if (ext == ".zip" && req.savedPath.find("/Inbox/") != std::string::npos) {
-    std::string unzipCmd = "unzip -o -qq '" + req.savedPath + "' -d '" +
-                           LsUtil::dirnameOf(req.savedPath) + "'";
-    Logger::info("LocalSend: extract -> " + unzipCmd);
-    int rc = std::system(unzipCmd.c_str());
+  Logger::info("BrickDrop: received " + req.savedPath);
+  if (LsUtil::lowerExt(req.savedPath) == ".zip") {
+    std::string cmd = "unzip -o -qq '" + req.savedPath + "' -d '" +
+                      LsUtil::dirnameOf(req.savedPath) + "'";
+    int rc = std::system(cmd.c_str());
     if (rc == 0) {
-      ::unlink(req.savedPath.c_str()); // xóa zip sau khi extract
-      Logger::info("LocalSend: extract OK, removed " + req.savedPath);
+      ::unlink(req.savedPath.c_str());
+      Logger::info("BrickDrop: unzipped " + req.savedPath);
     } else {
-      Logger::warn("LocalSend: extract failed rc=" + std::to_string(rc));
+      Logger::warn("BrickDrop: unzip failed rc=" + std::to_string(rc));
     }
   }
-
-  // 2. Trigger RomOrganizer (extension mapping → Roms/<sys>/)
-  try {
-    RomOrganizer::instance().organizeDirectory(
-        RomOrganizer::instance().getInboxDir());
-  } catch (const std::exception &e) {
-    Logger::warn(std::string("LocalSend: organize failed: ") + e.what());
-  }
-
-  // 3. Refresh RomIndexer (cho UI game list)
-  try {
-    RomIndexer::instance().scanAllSystems(AppConfig::instance().getRomsDir(),
-                                          nullptr);
-    UIManager::instance().setNeedLibraryRefresh(true);
-  } catch (...) {
-  }
-
-  // 4. Mở rộng RomCloud: nếu sender gửi kèm game metadata (gameId > 0),
-  // upsert game vào DB local với title/system/cover đầy đủ để UI hiển thị ngay.
-  if (req.file.gameId > 0) {
-    try {
-      GameRecord g;
-      g.id = req.file.gameId;
-      g.systemId = req.file.systemId;
-      g.title =
-          req.file.gameTitle.empty() ? req.file.fileName : req.file.gameTitle;
-      g.filename = req.file.fileName;
-      g.localPath = req.savedPath;
-      g.coverPath = req.file.coverPath;
-      g.localState = GameState::LOCAL;
-      struct stat st{};
-      if (::stat(req.savedPath.c_str(), &st) == 0)
-        g.sizeBytes = (uint64_t)st.st_size;
-      // cloudFileId giữ nguyên (nếu sender gửi kèm) — nhưng protocol chưa
-      // truyền, nên để rỗng → game này sẽ là LOCAL-only.
-
-      int64_t outId = 0;
-      if (DatabaseManager::instance().upsertGame(g, &outId)) {
-        if (outId > 0 && outId != req.file.gameId) {
-          // Sender dùng gameId riêng → DB local có id khác, OK.
-          Logger::info("LocalSend: upsertGame '" + g.title +
-                       "' id=" + std::to_string(outId) +
-                       " (sender id=" + std::to_string(req.file.gameId) + ")");
-        }
-        UIManager::instance().setNeedLibraryRefresh(true);
-      } else {
-        Logger::warn("LocalSend: upsertGame failed for '" + g.title + "'");
-      }
-    } catch (const std::exception &e) {
-      Logger::warn(std::string("LocalSend: game upsert failed: ") + e.what());
-    }
-  }
-
-  Logger::info("LocalSend: postProcess DONE");
 }
 
 // =============================================================
@@ -2462,4 +2401,4 @@ void LocalSendManager::clearFinishedTasks() {
   }
 }
 
-} // namespace RomCloud
+} // namespace BrickDrop

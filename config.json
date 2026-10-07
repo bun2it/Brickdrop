@@ -1,0 +1,9 @@
+{
+  "label": "BrickDrop",
+  "label.ch.lang": "BrickDrop",
+  "icon": "",
+  "iconsel": "",
+  "icontop": "icon.png",
+  "launch": "launch.sh",
+  "description": "Chia se file offline Brick-to-Brick, khong can router/internet"
+}

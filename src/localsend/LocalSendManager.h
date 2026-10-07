@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-namespace RomCloud {
+namespace BrickDrop {
 
 struct LsPendingPrepare {
   int clientFd = -1;
@@ -205,4 +205,4 @@ private:
   LocalSendManager &operator=(const LocalSendManager &) = delete;
 };
 
-} // namespace RomCloud
+} // namespace BrickDrop

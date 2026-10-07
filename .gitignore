@@ -1,4 +1,6 @@
 bin/
 build/
+build_pc/
 *.o
 *.a
+*.dSYM/

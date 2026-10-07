@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace RomCloud {
+namespace BrickDrop {
 
 // ----- Protocol constants (spec §1) -----------------------------------
 namespace LocalSendProto {
@@ -134,8 +134,9 @@ std::string basenameOf(const std::string& path);
 std::string dirnameOf(const std::string& path);
 std::string lowerExt(const std::string& path);
 std::string getOwnIp(const std::string& iface = "wlan0");
+const std::string& sdRoot(); // Config::sdRoot, tranh include vòng
 bool mkdirRecursive(const std::string& path, mode_t mode = 0755);
-uint64_t sdFreeBytes(const std::string& path = "/mnt/SDCARD");
+uint64_t sdFreeBytes(const std::string& path);
 std::string sha256OfFile(const std::string& path);
 std::string humanSize(uint64_t bytes);
 std::string humanSpeed(uint32_t bytesPerSec);
