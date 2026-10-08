@@ -5,6 +5,7 @@
 #include "../input/Input.h"
 #include "../localsend/LocalSendManager.h"
 #include <algorithm>
+#include <cctype>
 #include <dirent.h>
 #include <fstream>
 #include <sys/stat.h>
@@ -343,6 +344,15 @@ void App::openSendPicker() {
   setScreen(Screen::SEND_PICK);
 }
 
+void App::openFiles() {
+  // Lần đầu mở từ gốc thẻ nhớ, các lần sau giữ nguyên chỗ đang duyệt.
+  if (m_fileLs.path().empty())
+    m_fileLs.open(Config::instance().sdRoot());
+  else
+    m_fileLs.refresh();
+  setScreen(Screen::FILES);
+}
+
 void App::syncTrustedPeers() {
   std::vector<LsTrusted> t;
   for (auto &c : Config::instance().contacts()) {
@@ -462,6 +472,9 @@ void App::frame() {
   case Screen::SEND_DEVICES:
     onSendDevices();
     break;
+  case Screen::FILES:
+    onFiles();
+    break;
   case Screen::RECV_DIR:
     onRecvDir();
     break;
@@ -487,6 +500,9 @@ void App::frame() {
   case Screen::SEND_DEVICES:
     renderSendDevices();
     break;
+  case Screen::FILES:
+    renderFiles();
+    break;
   case Screen::RECV_DIR:
     renderRecvDir();
     break;
@@ -500,6 +516,9 @@ void App::frame() {
   if (!m_activePrompt.empty())
     renderIncoming();
   renderOta();
+  // Popup menu thao tác file (SELECT) vẽ trên cùng, dưới toast.
+  if (m_opsOpen)
+    renderOpsMenu();
   // Toast
   if (!m_toast.msg.empty()) {
     if (SDL_GetTicks() < m_toast.until) {
@@ -526,7 +545,7 @@ void App::onHome() {
     }
     return;
   }
-  const int n = 7;
+  const int n = 8;
   if (in.justPressed(Button::UP))
     m_sel = (m_sel + n - 1) % n;
   if (in.justPressed(Button::DOWN))
@@ -566,14 +585,16 @@ void App::onHome() {
         toast("Chưa chọn file/thư mục để gửi");
       }
     } else if (m_sel == 3) {
-      setScreen(Screen::OFFLINE);
+      openFiles(); // quản lý file (duyệt + SELECT để thao tác)
     } else if (m_sel == 4) {
+      setScreen(Screen::OFFLINE);
+    } else if (m_sel == 5) {
       // Chế độ hiển thị kiểu AirDrop: Mọi người → Danh bạ → Tắt.
       int v = (Config::instance().visibility() + 1) % 3;
       Config::instance().setVisibility(v);
       LocalSendManager::instance().setVisibility((LsVisibility)v);
       toast(std::string("Hiển thị: ") + visName(v));
-    } else if (m_sel == 5) {
+    } else if (m_sel == 6) {
       setScreen(Screen::PROGRESS);
     } else {
       m_exit = true;
@@ -583,6 +604,11 @@ void App::onHome() {
 
 void App::onSendPick() {
   if (pickerInput(m_sendLs, PickMode::SEND_FILE))
+    setScreen(Screen::HOME);
+}
+
+void App::onFiles() {
+  if (pickerInput(m_fileLs, PickMode::MANAGE))
     setScreen(Screen::HOME);
 }
 
@@ -716,6 +742,15 @@ void App::onRecvDir() {
 // pickerInput trả true → caller về HOME (B ở root / MENU).
 bool App::pickerInput(DirLister &ls, PickMode mode) {
   auto &in = Input::instance();
+  // Popup menu thao tác file (SELECT): khi mở thì chặn mọi phím khác.
+  if (m_opsOpen) {
+    opsMenuInput(ls);
+    return false;
+  }
+  if (in.justPressed(Button::SELECT)) {
+    openOpsMenu(ls);
+    return false;
+  }
   if (in.justPressed(Button::UP)) {
     ls.moveSel(-1);
     return false;
@@ -754,6 +789,9 @@ bool App::pickerInput(DirLister &ls, PickMode mode) {
       Config::instance().setSendPresetFolder("");
       toast("Đã chọn: " + e->name);
       return true; // về HOME
+    } else if (mode == PickMode::MANAGE && e) {
+      // Quản lý file: A vào file chỉ xem thông tin, không đặt preset gửi.
+      toast(e->name + " (" + DirLister::humanSize(e->size) + ")");
     }
     return false;
   }
@@ -794,6 +832,9 @@ bool App::pickerInput(DirLister &ls, PickMode mode) {
       confirmRecvDir(ls);
       return true;
     }
+  }
+  // X: tạo thư mục mới (màn thư mục nhận + quản lý file).
+  if ((mode == PickMode::RECV_DIR || mode == PickMode::MANAGE)) {
     if (in.justPressed(Button::X)) {
       std::string n = ls.suggestFolderName("BrickDrop");
       if (ls.mkdir(n))
@@ -817,6 +858,220 @@ void App::confirmRecvDir(DirLister &ls) {
   // Hiện rõ path vừa chốt (dạng gọn, bỏ prefix /mnt/SDCARD).
   std::string disp = rel.empty() ? "/ (gốc thẻ nhớ)" : rel;
   toast("Thư mục nhận: " + disp);
+}
+
+// ================== Popup menu thao tác file (SELECT) ==================
+// Mở bằng SELECT trong explorer. Điều hướng UP/DOWN, A chọn, B đóng.
+void App::openOpsMenu(DirLister &ls) {
+  const DirEntry *e = ls.current();
+  m_opsActs.clear();
+  m_opsTarget.clear();
+  if (m_clip.has)
+    m_opsActs.push_back(OpsAct::PASTE);
+  if (e) {
+    m_opsTarget = e->path;
+    m_opsTargetIsDir = e->isDir;
+    m_opsActs.push_back(OpsAct::COPY);
+    m_opsActs.push_back(OpsAct::CUT);
+    m_opsActs.push_back(OpsAct::DELETE);
+    if (!e->isDir) {
+      std::string low = e->name;
+      for (auto &c : low)
+        c = (char)tolower((unsigned char)c);
+      if (low.size() >= 4 && low.compare(low.size() - 4, 4, ".zip") == 0)
+        m_opsActs.push_back(OpsAct::UNZIP);
+    }
+  }
+  if (m_opsActs.empty()) {
+    toast("Không có gì để thao tác");
+    return;
+  }
+  m_opsSel = 0;
+  m_opsConfirmDelete = false;
+  m_opsOpen = true;
+}
+
+void App::opsMenuInput(DirLister &ls) {
+  auto &in = Input::instance();
+  // Modal xác nhận xoá: A xoá, B huỷ.
+  if (m_opsConfirmDelete) {
+    if (in.justPressed(Button::A)) {
+      std::string name = DirLister::baseName(m_opsTarget);
+      if (DirLister::removeRec(m_opsTarget)) {
+        toast("Đã xoá " + name);
+        if (m_clip.has && m_clip.src == m_opsTarget)
+          m_clip.has = false;
+        // Preset gửi đang trỏ vào file vừa xoá -> dọn luôn.
+        if (m_pickFile == m_opsTarget) {
+          m_pickFile.clear();
+          Config::instance().setSendPresetFile("");
+        }
+        if (m_pickFolder == m_opsTarget) {
+          m_pickFolder.clear();
+          m_pickFolderFiles.clear();
+          m_pickFolderTotal = 0;
+          Config::instance().setSendPresetFolder("");
+        }
+      } else {
+        toast("Xoá thất bại");
+      }
+      m_opsConfirmDelete = false;
+      m_opsOpen = false;
+      ls.refresh();
+    } else if (in.justPressed(Button::B)) {
+      m_opsConfirmDelete = false;
+    }
+    return;
+  }
+  int n = (int)m_opsActs.size();
+  if (in.justPressed(Button::UP))
+    m_opsSel = (m_opsSel - 1 + n) % n;
+  else if (in.justPressed(Button::DOWN))
+    m_opsSel = (m_opsSel + 1) % n;
+  else if (in.justPressed(Button::B))
+    m_opsOpen = false;
+  else if (in.justPressed(Button::A))
+    doOpsAction(ls, m_opsActs[(size_t)m_opsSel]);
+}
+
+void App::doOpsAction(DirLister &ls, OpsAct act) {
+  std::string name = DirLister::baseName(m_opsTarget);
+  switch (act) {
+  case OpsAct::COPY:
+    m_clip = {true, false, m_opsTarget, m_opsTargetIsDir};
+    m_opsOpen = false;
+    toast("Đã sao chép '" + name + "' — tới thư mục cần, SELECT > Dán");
+    break;
+  case OpsAct::CUT:
+    m_clip = {true, true, m_opsTarget, m_opsTargetIsDir};
+    m_opsOpen = false;
+    toast("Đã cắt '" + name + "' — tới thư mục cần, SELECT > Dán");
+    break;
+  case OpsAct::PASTE:
+    pasteClip(ls);
+    break;
+  case OpsAct::DELETE:
+    m_opsConfirmDelete = true;
+    break;
+  case OpsAct::UNZIP:
+    m_opsOpen = false;
+    if (DirLister::unzipToDir(m_opsTarget, ls.path()))
+      toast("Đã bung '" + name + "'");
+    else
+      toast("Bung zip thất bại");
+    ls.refresh();
+    break;
+  }
+}
+
+void App::pasteClip(DirLister &ls) {
+  if (!m_clip.has) {
+    m_opsOpen = false;
+    return;
+  }
+  std::string src = m_clip.src;
+  struct stat st;
+  if (stat(src.c_str(), &st) != 0) {
+    toast("File gốc không còn nữa");
+    m_clip.has = false;
+    m_opsOpen = false;
+    return;
+  }
+  std::string name = DirLister::baseName(src);
+  // Dời vào chính thư mục chứa nó -> vô nghĩa.
+  if (m_clip.cut && DirLister::dirName(src) == ls.path()) {
+    toast("Đã ở đây rồi");
+    m_opsOpen = false;
+    return;
+  }
+  // Không dán thư mục vào trong chính nó.
+  if (m_clip.srcIsDir &&
+      (ls.path() == src || ls.path().compare(0, src.size() + 1, src + "/") == 0)) {
+    toast("Không thể dán vào chính nó");
+    m_opsOpen = false;
+    return;
+  }
+  std::string dst = ls.path() + "/" + ls.suggestName(name);
+  // File lẻ: kiểm tra dung lượng trước cho rõ ràng.
+  if (!m_clip.srcIsDir && (uint64_t)st.st_size > DirLister::diskFree(ls.path())) {
+    toast("Không đủ dung lượng");
+    m_opsOpen = false;
+    return;
+  }
+  bool ok = m_clip.cut ? DirLister::movePath(src, dst) : DirLister::copyRec(src, dst);
+  if (ok) {
+    toast(m_clip.cut ? "Đã dời '" + name + "'" : "Đã dán '" + name + "'");
+    // Preset gửi đi theo file/thư mục vừa dời.
+    if (m_clip.cut) {
+      if (m_pickFile == src) {
+        m_pickFile = dst;
+        Config::instance().setSendPresetFile(dst);
+      }
+      if (m_pickFolder == src) {
+        m_pickFolder = dst;
+        Config::instance().setSendPresetFolder(dst);
+        for (auto &pr : m_pickFolderFiles)
+          if (pr.first.compare(0, src.size(), src) == 0)
+            pr.first = dst + pr.first.substr(src.size());
+      }
+    }
+  } else {
+    toast("Thất bại");
+  }
+  m_clip.has = false;
+  m_opsOpen = false;
+  ls.refresh();
+}
+
+void App::renderOpsMenu() {
+  // Nền mờ phủ lên picker.
+  rect(0, 0, W, H, {0, 0, 0, 160});
+  if (m_opsConfirmDelete) {
+    std::string name = DirLister::baseName(m_opsTarget);
+    modal("Xoá?",
+          {"Xoá '" + name + "'" + (m_opsTargetIsDir ? " (cả thư mục!)" : ""),
+           "Không thể hoàn tác."},
+          {{"A", "Xoá"}, {"B", "Huỷ"}});
+    return;
+  }
+  int n = (int)m_opsActs.size();
+  int w = 480, rowH = 52;
+  int h = 150 + n * rowH;
+  int x = (W - w) / 2, y = (H - h) / 2;
+  rect(x, y, w, h, C_PANEL);
+  rect(x, y, w, h, C_FOCUS, false);
+  std::string title = m_opsTarget.empty()
+                          ? "Thao tác"
+                          : "Thao tác: " + DirLister::baseName(m_opsTarget);
+  drawText(trunc(title, m_fMain, w - 48), x + 24, y + 16, C_TEXT, m_fMain);
+  rect(x + 24, y + 54, w - 48, 2, C_DIM);
+  for (int i = 0; i < n; ++i) {
+    int iy = y + 66 + i * rowH;
+    bool sel = (i == m_opsSel);
+    if (sel)
+      rect(x + 12, iy, w - 24, rowH - 8, C_FOCUS);
+    std::string label;
+    switch (m_opsActs[i]) {
+    case OpsAct::PASTE:
+      label = "Dán '" + DirLister::baseName(m_clip.src) + "'" +
+              (m_clip.cut ? " (dời)" : "");
+      break;
+    case OpsAct::COPY:
+      label = "Sao chép";
+      break;
+    case OpsAct::CUT:
+      label = "Dời";
+      break;
+    case OpsAct::DELETE:
+      label = "Xoá";
+      break;
+    case OpsAct::UNZIP:
+      label = "Bung zip";
+      break;
+    }
+    drawText(trunc(label, m_fMain, w - 80), x + 32, iy + 8, C_TEXT, m_fMain);
+  }
+  drawText("A Chọn · B Đóng", x + w / 2, y + h - 38, C_DIM, m_fSmall, true);
 }
 
 void App::renderPicker(DirLister &ls, const std::string &title, PickMode mode) {
@@ -867,7 +1122,7 @@ void App::renderPicker(DirLister &ls, const std::string &title, PickMode mode) {
                  y + 8, 34, 34);
     int rowRight = px + pw - 16;
     std::string sub;
-    if (mode == PickMode::SEND_FILE && !e.isDir)
+    if ((mode == PickMode::SEND_FILE || mode == PickMode::MANAGE) && !e.isDir)
       sub = DirLister::humanSize(e.size);
     int sizeW = sub.empty() ? 0 : textW(sub, m_fSmall);
     int nameMaxW = rowRight - (px + 60) - (sizeW > 0 ? sizeW + 16 : 0);
@@ -892,12 +1147,21 @@ void App::renderPicker(DirLister &ls, const std::string &title, PickMode mode) {
              60, H - FTR - 36, here ? C_OK : C_DIM, m_fSmall);
   }
   if (mode == PickMode::SEND_FILE)
-    footer({{"A", "Vào/Chọn"}, {"X", "Chọn thư mục"}, {"B", "Lên/Thoát"}});
+    footer({{"A", "Vào/Chọn"},
+            {"X", "Chọn thư mục"},
+            {"SELECT", "Thao tác"},
+            {"B", "Lên/Thoát"}});
+  else if (mode == PickMode::MANAGE)
+    footer({{"A", "Vào/Xem"},
+            {"X", "Tạo thư mục"},
+            {"SELECT", "Thao tác"},
+            {"B", "Về"}});
   else
     footer({{"A", "Vào"},
             {"Y", "Chốt"},
             {"START", "Chốt + Về"},
             {"X", "Tạo thư mục"},
+            {"SELECT", "Thao tác"},
             {"B", "Về"}});
 }
 
@@ -1005,12 +1269,12 @@ void App::renderHome() {
   // Mô hình preset: File/thư mục gửi đi (chọn trước ở hàng 1) /
   // Thư mục nhận (preset) / Gửi đi (chỉ chọn máy, không chọn folder) / ...
   const char *items[] = {"File/thư mục gửi đi", "Thư mục nhận", "Gửi đi",
-                         "WiFi Hotspot", "Hiển thị", "Tiến trình truyền",
-                         "Thoát"};
-  int y = 78;
-  for (int i = 0; i < 7; ++i) {
+                         "Quản lý file", "WiFi Hotspot", "Hiển thị",
+                         "Tiến trình truyền", "Thoát"};
+  int y = 76;
+  for (int i = 0; i < 8; ++i) {
     bool sel = (i == m_sel);
-    row(60, y, W - 120, 58, sel);
+    row(60, y, W - 120, 54, sel);
     SDL_Color tc = sel ? SDL_Color{0, 0, 0, 255} : C_TEXT;
     if (i == 0) {
       // Preset: path thư mục hoặc tên file sẽ gửi.
@@ -1055,13 +1319,13 @@ void App::renderHome() {
         int tw = textW(warn, m_fSmall);
         int pw = tw + 28, ph = 34;
         int px = 60 + (W - 120) - 16 - pw;
-        int py = y + (58 - ph) / 2;
+        int py = y + (54 - ph) / 2;
         SDL_Color orange{255, 140, 0, 255};
         rect(px, py, pw, ph, orange);
         rect(px, py, pw, ph, {0, 0, 0, 255}, false);
         drawText(warn, px + pw / 2, py + 4, {0, 0, 0, 255}, m_fSmall, true);
       }
-    } else if (i == 4) {
+    } else if (i == 5) {
       // Nút "Hiển thị" hiện chế độ hiện tại (2 dòng).
       drawText(items[i], 90, y + 2, tc, m_fMain);
       drawText(visName(Config::instance().visibility()), 90, y + 30,
@@ -1069,7 +1333,7 @@ void App::renderHome() {
     } else {
       drawText(items[i], 90, y + 14, tc, m_fMain);
     }
-    y += 66;
+    y += 60;
   }
   std::string st = "IP " + wd.ownIp() + "  |  Nơi nhận: " +
                    Config::instance().saveDir() + "  |  v" +
@@ -1082,6 +1346,10 @@ void App::renderHome() {
 
 void App::renderSendPick() {
   renderPicker(m_sendLs, "Chọn file gửi", PickMode::SEND_FILE);
+}
+
+void App::renderFiles() {
+  renderPicker(m_fileLs, "Quản lý file", PickMode::MANAGE);
 }
 
 void App::renderSendDevices() {

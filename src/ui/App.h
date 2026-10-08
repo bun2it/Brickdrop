@@ -16,10 +16,10 @@
 
 namespace BrickDrop {
 
-enum class Screen { HOME, SEND_PICK, SEND_DEVICES, RECV_DIR, PROGRESS, OFFLINE };
+enum class Screen { HOME, SEND_PICK, SEND_DEVICES, FILES, RECV_DIR, PROGRESS, OFFLINE };
 
 // Chế độ của file picker 1-pane (port từ RomCloud renderLocalSendFolderPicker).
-enum class PickMode { SEND_FILE, RECV_DIR };
+enum class PickMode { SEND_FILE, RECV_DIR, MANAGE };
 
 struct Toast {
   std::string msg;
@@ -59,12 +59,15 @@ private:
   // Vào màn chọn file gửi: giữ nguyên thư mục đang duyệt (refresh thay vì
   // open lại từ root) — gửi nhiều file cùng folder không phải đi lại.
   void openSendPicker();
+  // Vào màn quản lý file: giữ nguyên thư mục đang duyệt (như openSendPicker).
+  void openFiles();
   void restartService();
   void pumpLsQueues();
 
   void onHome();
   void onSendPick();
   void onSendDevices();
+  void onFiles();
   void onRecvDir();
   void onProgress();
   void onOffline();
@@ -76,9 +79,32 @@ private:
   void renderPicker(DirLister &ls, const std::string &title, PickMode mode);
   void confirmRecvDir(DirLister &ls);
 
+  // Popup menu thao tác file trong explorer (mở bằng SELECT).
+  // Điều hướng UP/DOWN, A chọn, B đóng — đúng như Tai yêu cầu.
+  enum class OpsAct { PASTE, COPY, CUT, DELETE, UNZIP };
+  struct FileClip {
+    bool has = false;
+    bool cut = false; // true = dời, false = sao chép
+    std::string src;
+    bool srcIsDir = false;
+  };
+  bool m_opsOpen = false;
+  int m_opsSel = 0;
+  std::vector<OpsAct> m_opsActs;
+  FileClip m_clip;
+  bool m_opsConfirmDelete = false;
+  std::string m_opsTarget; // path của entry đang thao tác (copy lúc mở menu)
+  bool m_opsTargetIsDir = false;
+  void openOpsMenu(DirLister &ls);
+  void opsMenuInput(DirLister &ls);
+  void renderOpsMenu();
+  void doOpsAction(DirLister &ls, OpsAct act);
+  void pasteClip(DirLister &ls);
+
   void renderHome();
   void renderSendPick();
   void renderSendDevices();
+  void renderFiles();
   void renderRecvDir();
   void renderProgress();
   void renderOffline();
@@ -95,6 +121,7 @@ private:
 
   DirLister m_sendLs;
   DirLister m_recvLs;
+  DirLister m_fileLs; // explorer "Quản lý file" (giữ vị trí duyệt giữa các lần mở)
   bool m_recvDirsOnly = true;
   IconCache m_icons; // PNG icons (port từ RomCloud drawGridIcon)
   std::string m_pickFile; // file đã chọn để gửi

@@ -10,6 +10,7 @@ Gửi file qua lại giữa các máy TrimUI Brick Pro — không cần WiFi nh�
 - **Tự chọn nơi lưu**: chọn thư mục để chứa file nhận về.
 - **Danh bạ**: lưu máy quen vào danh bạ, chỉ hiện những máy mình muốn thấy.
 - **File nhận được kiểm tra đầy đủ** trước khi lưu, file lỗi sẽ bị từ chối.
+- **Quản lý file**: sao chép, dời, xoá, bung file zip ngay trong app (nút SELECT).
 - **Tự cập nhật**: có bản mới là app tự báo, bấm một nút là xong.
 
 ## Lưu ý
