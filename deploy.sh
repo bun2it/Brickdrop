@@ -3,9 +3,10 @@
 set -e
 cd "$(dirname "$0")"
 APP=/mnt/SDCARD/Apps/BrickDrop
-adb shell "mkdir -p $APP/bin $APP/assets/fonts"
+adb shell "mkdir -p $APP/bin $APP/assets/fonts $APP/assets/icons"
 adb push bin/brickdrop $APP/bin/brickdrop
 adb push assets/fonts/NotoSans-Regular.ttf $APP/assets/fonts/NotoSans-Regular.ttf
+adb push assets/icons/. $APP/assets/icons/
 adb push launch.sh $APP/launch.sh
 adb push config.json $APP/config.json
 if [ -f icon.png ]; then

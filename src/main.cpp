@@ -4,6 +4,7 @@
 #include "core/Logger.h"
 #include "input/Input.h"
 #include "localsend/LocalSendManager.h"
+#include "net/BleLinkManager.h"
 #include "ui/App.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
@@ -25,7 +26,7 @@ static int selftest() {
   };
   check(!Config::instance().sdRoot().empty(), "sdRoot=" + Config::instance().sdRoot());
   check(!Config::instance().alias().empty(), "alias=" + Config::instance().alias());
-  check(Config::instance().fingerprint().size() == 32, "fingerprint 32hex");
+  check(Config::instance().fingerprint().size() == 64, "fingerprint 64hex (DeviceIdentity)");
   {
     DirLister d;
     check(d.open(Config::instance().sdRoot()), "DirLister open sdRoot");
@@ -37,7 +38,11 @@ static int selftest() {
   check(ls.start(), "LocalSend start");
   sleep(1);
   {
-    FILE *p = popen("curl -m 5 -s http://127.0.0.1:53317/api/localsend/v2/info", "r");
+    // BrickDrop dùng kServicePort (53318) để tránh đụng RomCloud (53317).
+    std::string url = "curl -m 5 -s http://127.0.0.1:" +
+                      std::to_string(LocalSendProto::kServicePort) +
+                      "/api/localsend/v2/info";
+    FILE *p = popen(url.c_str(), "r");
     char buf[512] = {0};
     if (p) {
       fread(buf, 1, sizeof(buf) - 1, p);
@@ -50,6 +55,9 @@ static int selftest() {
     check(sup, "WiFi AP/P2P support (iw list)");
     printf("  ownIp=%s\n", WifiDirectManager::instance().ownIp().c_str());
   }
+  // BLE là optional (thiếu thì app vẫn chạy LAN-only) → chỉ in, không check.
+  printf("  BLE hci0: %s\n",
+         BleLinkManager::hciPresent() ? "có" : "không (LAN-only)");
   ls.stop();
   printf(fails ? "SELFTEST FAIL (%d)\n" : "SELFTEST PASS\n", fails);
   return fails ? 1 : 0;
@@ -94,6 +102,9 @@ int main(int argc, char **argv) {
 
   auto &ls = LocalSendManager::instance();
   ls.setAlias(Config::instance().alias());
+  // Chế độ hiển thị kiểu AirDrop + danh bạ đã lưu (áp trước khi start).
+  ls.setVisibility((LsVisibility)Config::instance().visibility());
+  App::syncTrustedPeers();
   // Nơi nhận mặc định = saveDir đã chốt (qua setTargetFolder ở màn RECV_DIR).
   {
     std::string rel = Config::instance().saveDir();
@@ -123,6 +134,14 @@ int main(int argc, char **argv) {
     SDL_Delay(16);
   }
 
+  // Điều kiện của Tai: thoát app → khôi phục WiFi gốc NGAY để có internet
+  // (xóa profile BrickDrop-*, về lại SSID đã lưu lúc mở app).
+  {
+    std::string wmsg;
+    WifiDirectManager::instance().restoreOriginalWifi(wmsg);
+    Logger::info("BrickDrop exit wifi: " + wmsg);
+  }
+
   app.shutdown();
   ls.stop();
   Input::instance().shutdown();
@@ -131,5 +150,6 @@ int main(int argc, char **argv) {
   TTF_Quit();
   SDL_Quit();
   Logger::info("BrickDrop exit");
-  return 0;
+  // 42 = OTA cập nhật xong → launch.sh chạy lại bản mới.
+  return app.exitCode();
 }

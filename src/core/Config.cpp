@@ -1,4 +1,5 @@
 #include "Config.h"
+#include "DeviceIdentity.h"
 #include "Logger.h"
 #include <cstdlib>
 #include <fstream>
@@ -47,24 +48,6 @@ void Config::writeFile1(const std::string &p, const std::string &s) {
   out << s;
 }
 
-std::string Config::randomHex(int n) {
-  static const char hex[] = "0123456789abcdef";
-  std::string out;
-  std::ifstream ur("/dev/urandom", std::ios::binary);
-  unsigned char buf[64];
-  if (ur && n <= 64 && ur.read(reinterpret_cast<char *>(buf), n)) {
-    for (int i = 0; i < n; ++i)
-      out += hex[buf[i] & 0xF];
-    return out;
-  }
-  unsigned seed = static_cast<unsigned>(time(nullptr) ^ getpid());
-  for (int i = 0; i < n; ++i) {
-    seed = seed * 1103515245 + 12345;
-    out += hex[(seed >> 16) & 0xF];
-  }
-  return out;
-}
-
 void Config::load() {
   if (m_loaded)
     return;
@@ -87,12 +70,6 @@ void Config::load() {
     };
     m_alias = std::string(kAdj[pick(18)]) + " " + kFruit[pick(16)];
     writeFile1(d + "/alias", m_alias);
-  }
-  m_fp = readFile1(d + "/fp");
-  if (m_fp.size() != 32) {
-    m_fp = randomHex(32);
-    writeFile1(d + "/fp", m_fp);
-    Logger::info("BrickDrop: generated new fingerprint");
   }
   m_saveDir = readFile1(d + "/savedir");
   if (m_saveDir.empty()) {
@@ -129,8 +106,8 @@ void Config::regenerateAlias() {
   setAlias(std::string(kAdj[pick(18)]) + " " + kFruit[pick(16)]);
 }
 std::string Config::fingerprint() {
-  load();
-  return m_fp;
+  // ID ổn định từ phần cứng (MAC-hash), không còn random mỗi máy.
+  return DeviceIdentity::instance().deviceId();
 }
 std::string Config::saveDir() {
   load();
@@ -140,6 +117,143 @@ void Config::setSaveDir(const std::string &d) {
   load();
   m_saveDir = d;
   writeFile1(stateDir() + "/savedir", d);
+}
+
+int Config::visibility() {
+  load();
+  std::string v = readFile1(stateDir() + "/visibility");
+  if (v == "1")
+    return 1;
+  if (v == "2")
+    return 2;
+  return 0;
+}
+void Config::setVisibility(int v) {
+  load();
+  if (v < 0)
+    v = 0;
+  if (v > 2)
+    v = 2;
+  writeFile1(stateDir() + "/visibility", std::to_string(v));
+}
+
+std::vector<Config::Contact> Config::contacts() {
+  load();
+  std::vector<Contact> out;
+  std::ifstream in(stateDir() + "/contacts");
+  std::string line;
+  while (std::getline(in, line)) {
+    // fp|alias|ip|port
+    size_t a = line.find('|');
+    size_t b = line.find('|', a + 1);
+    size_t c = line.find('|', b + 1);
+    if (a == std::string::npos || b == std::string::npos || c == std::string::npos)
+      continue;
+    Contact ct;
+    ct.fp = line.substr(0, a);
+    ct.alias = line.substr(a + 1, b - a - 1);
+    ct.ip = line.substr(b + 1, c - b - 1);
+    try {
+      ct.port = std::stoi(line.substr(c + 1));
+    } catch (...) {
+      ct.port = 53317;
+    }
+    if (!ct.fp.empty())
+      out.push_back(ct);
+  }
+  return out;
+}
+
+static std::string contactFile(const std::string &dir) { return dir + "/contacts"; }
+
+bool Config::addContact(const std::string &fp, const std::string &alias,
+                        const std::string &ip, int port) {
+  load();
+  if (fp.empty())
+    return false;
+  auto v = contacts();
+  for (auto &c : v) {
+    if (c.fp == fp) {
+      c.alias = alias;
+      c.ip = ip;
+      c.port = port > 0 ? port : 53317;
+    }
+  }
+  bool found = false;
+  for (auto &c : v)
+    if (c.fp == fp)
+      found = true;
+  if (!found) {
+    Contact c;
+    c.fp = fp;
+    c.alias = alias;
+    c.ip = ip;
+    c.port = port > 0 ? port : 53317;
+    v.push_back(c);
+  }
+  std::string tmp;
+  for (auto &c : v) {
+    std::string a = c.alias;
+    for (auto &ch : a)
+      if (ch == '|')
+        ch = ' ';
+    tmp += c.fp + "|" + a + "|" + c.ip + "|" + std::to_string(c.port) + "\n";
+  }
+  writeFile1(contactFile(stateDir()), tmp);
+  return true;
+}
+
+bool Config::removeContact(const std::string &fp) {
+  load();
+  auto v = contacts();
+  std::string tmp;
+  bool removed = false;
+  for (auto &c : v) {
+    if (c.fp == fp) {
+      removed = true;
+      continue;
+    }
+    tmp += c.fp + "|" + c.alias + "|" + c.ip + "|" + std::to_string(c.port) + "\n";
+  }
+  if (removed)
+    writeFile1(contactFile(stateDir()), tmp);
+  return removed;
+}
+
+bool Config::isContact(const std::string &fp) {
+  if (fp.empty())
+    return false;
+  for (auto &c : contacts())
+    if (c.fp == fp)
+      return true;
+  return false;
+}
+
+bool Config::updateContactNet(const std::string &fp, const std::string &ip,
+                              int port) {  load();
+  if (fp.empty() || ip.empty())
+    return false;
+  auto v = contacts();
+  bool changed = false;
+  for (auto &c : v) {
+    if (c.fp == fp && (c.ip != ip || c.port != port)) {
+      c.ip = ip;
+      c.port = port > 0 ? port : 53317;
+      changed = true;
+    }
+  }
+  if (!changed)
+    return false;
+  std::string tmp;
+  for (auto &c : v) {
+    std::string a = c.alias;
+    for (auto &ch : a)
+      if (ch == '|')
+        ch = ' ';
+    tmp += c.fp + "|" + a + "|" + c.ip + "|" + std::to_string(c.port) + "\n";
+  }
+  writeFile1(stateDir() + "/contacts", tmp);
+  return true;
 }
 
 static std::string ipOf(const std::string &iface) {
@@ -191,6 +305,24 @@ std::string Config::netInterface() {
     return out;
   }
   return "";
+}
+
+// Preset gửi: file/folder đã chọn sẵn để chờ gửi (persist qua lần mở app).
+std::string Config::sendPresetFile() {
+  load();
+  return readFile1(stateDir() + "/sendfile");
+}
+void Config::setSendPresetFile(const std::string &p) {
+  load();
+  writeFile1(stateDir() + "/sendfile", p);
+}
+std::string Config::sendPresetFolder() {
+  load();
+  return readFile1(stateDir() + "/sendfolder");
+}
+void Config::setSendPresetFolder(const std::string &p) {
+  load();
+  writeFile1(stateDir() + "/sendfolder", p);
 }
 
 } // namespace BrickDrop

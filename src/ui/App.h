@@ -3,7 +3,10 @@
 // Không nhập liệu: mọi chọn lựa qua D-pad + A/B/X/Y/START.
 #include "../explorer/DirLister.h"
 #include "../localsend/LocalSendProtocol.h"
+#include "../net/BleLinkFlow.h"
 #include "../net/WifiDirectManager.h"
+#include "../ota/UpdateManager.h"
+#include "IconCache.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <deque>
@@ -14,6 +17,9 @@
 namespace BrickDrop {
 
 enum class Screen { HOME, SEND_PICK, SEND_DEVICES, RECV_DIR, PROGRESS, OFFLINE };
+
+// Chế độ của file picker 1-pane (port từ RomCloud renderLocalSendFolderPicker).
+enum class PickMode { SEND_FILE, RECV_DIR };
 
 struct Toast {
   std::string msg;
@@ -26,6 +32,12 @@ public:
   void shutdown();
   void frame(); // 1 frame: input + render
   bool shouldExit() const { return m_exit; }
+  // 0 = thoát thường; 42 = OTA xong → launch.sh chạy lại bản mới.
+  int exitCode() const { return m_exitCode; }
+  // Đồng bộ danh bạ đã lưu → trusted peers của LocalSendManager.
+  // Gọi khi khởi động và mỗi khi danh bạ đổi (static: main() gọi trước khi
+  // App init).
+  static void syncTrustedPeers();
 
 private:
   // --- helpers ---
@@ -44,6 +56,9 @@ private:
 
   void setScreen(Screen s);
   void refreshDevices();
+  // Vào màn chọn file gửi: giữ nguyên thư mục đang duyệt (refresh thay vì
+  // open lại từ root) — gửi nhiều file cùng folder không phải đi lại.
+  void openSendPicker();
   void restartService();
   void pumpLsQueues();
 
@@ -54,6 +69,12 @@ private:
   void onProgress();
   void onOffline();
   void onIncoming(); // modal A/B, gọi cuối frame nếu có prompt
+
+  // File picker 1-pane dùng chung cho SEND_PICK (chọn file gửi) và
+  // RECV_DIR (chọn thư mục nhận). pickerInput trả true → về HOME.
+  bool pickerInput(DirLister &ls, PickMode mode);
+  void renderPicker(DirLister &ls, const std::string &title, PickMode mode);
+  void confirmRecvDir(DirLister &ls);
 
   void renderHome();
   void renderSendPick();
@@ -75,13 +96,32 @@ private:
   DirLister m_sendLs;
   DirLister m_recvLs;
   bool m_recvDirsOnly = true;
+  IconCache m_icons; // PNG icons (port từ RomCloud drawGridIcon)
   std::string m_pickFile; // file đã chọn để gửi
+  std::string m_lastDeviceFp; // fingerprint thiết bị vừa gửi (tự chọn lại)
+  // Gửi cả thư mục: folder đã chọn + danh sách file đệ quy (abs, relDir).
+  std::string m_pickFolder;
+  std::vector<std::pair<std::string, std::string>> m_pickFolderFiles;
+  uint64_t m_pickFolderTotal = 0;
   std::vector<LsDeviceInfo> m_devices;
 
   std::vector<WifiGroup> m_groups;
   bool m_scanning = false;
   bool m_working = false; // op mạng nền đang chạy
   std::string m_workMsg;
+  // Phase D: BLE handshake connectionless → Wi-Fi link tự động.
+  BleLinkFlow m_bleFlow;
+  // Bắt đầu gửi file/thư mục đã stage tới thiết bị LAN (tách từ onSendDevices
+  // để BleLinkFlow gọi lại sau khi link Wi-Fi dựng xong).
+  void startSendTo(const LsDeviceInfo &target);
+  // OTA cập nhật: auto-check lúc mở app (nền, im lặng khi offline).
+  std::mutex m_otaMtx;
+  bool m_otaAvailable = false;
+  OtaInfo m_otaInfo;
+  enum class OtaUi { NONE, PROMPT, BUSY } m_otaUi = OtaUi::NONE;
+  int m_exitCode = 0; // 42 = OTA xong → launch.sh chạy lại bản mới
+  void pumpOta();
+  void renderOta();
 
   // Hàng đợi từ LocalSend callbacks (network threads)
   std::mutex m_qmtx;

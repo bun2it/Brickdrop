@@ -69,12 +69,17 @@ std::string WifiDirectManager::ownIp() {
 }
 
 std::string WifiDirectManager::startGroup(std::string &outMsg) {
+  // SSID theo fingerprint gọn cho dễ nhận (flow thủ công).
+  std::string tag = Config::instance().fingerprint().substr(0, 4);
+  return startGroupWithTag(tag, outMsg);
+}
+
+std::string WifiDirectManager::startGroupWithTag(const std::string &tag,
+                                                std::string &outMsg) {
   if (!haveTool("hostapd") || !haveTool("udhcpd")) {
     outMsg = "Thiếu hostapd/udhcpd trên máy";
     return "";
   }
-  // SSID theo alias cho dễ nhận: BrickDrop-Nice-Orange -> gọn lại.
-  std::string tag = Config::instance().fingerprint().substr(0, 4);
   m_ssid = std::string(Config::kGroupPrefix) + tag;
   std::string conf = "/tmp/brickdrop_hostapd.conf";
   {
@@ -117,19 +122,136 @@ std::string WifiDirectManager::startGroup(std::string &outMsg) {
     return "";
   }
   m_mode = LinkMode::HOST;
-  outMsg = "Đã phát " + m_ssid;
+  outMsg = "Hotspot đang phát: " + m_ssid;
   Logger::info("BrickDrop: hosting " + m_ssid);
   return m_ssid;
 }
 
-bool WifiDirectManager::stopGroup(std::string &outMsg) {
+// Parse "key=value" từ output `wpa_cli status` (dòng đầu hoặc sau \n).
+static std::string wpaVal(const std::string &st, const char *key) {
+  std::string pat = std::string(key) + "=";
+  size_t p = st.find("\n" + pat);
+  size_t v;
+  if (p != std::string::npos) {
+    v = p + 1 + pat.size();
+  } else if (st.compare(0, pat.size(), pat) == 0) {
+    v = pat.size();
+  } else {
+    return "";
+  }
+  size_t e = st.find('\n', v);
+  return st.substr(v, e == std::string::npos ? e : e - v);
+}
+
+void WifiDirectManager::saveOriginalWifi() {
+  if (!m_origSsid.empty())
+    return; // chỉ lưu 1 lần mỗi lần chạy app
+  std::string ssid = wpaVal(wpa("status"), "ssid");
+  std::string prefix = Config::kGroupPrefix;
+  // Bỏ qua nếu đang dính trong nhóm BrickDrop-* (thoát bẩn lần trước) —
+  // lúc đó "gốc" thật sự không biết được, để trống cho an toàn.
+  if (!ssid.empty() && ssid.compare(0, prefix.size(), prefix) != 0)
+    m_origSsid = ssid;
+  Logger::info(std::string("BrickDrop: original wifi ssid=") +
+               (m_origSsid.empty() ? "(none)" : m_origSsid));
+}
+
+std::string WifiDirectManager::findNetworkId(const std::string &ssid) {
+  std::string list = wpa("list_networks");
+  size_t pos = 0;
+  bool first = true;
+  while (pos < list.size()) {
+    size_t e = list.find('\n', pos);
+    std::string line = list.substr(pos, e == std::string::npos ? e : e - pos);
+    pos = e == std::string::npos ? list.size() : e + 1;
+    if (first) {
+      first = false;
+      continue; // dòng header
+    }
+    // Format: network id \t ssid \t bssid \t flags
+    size_t t = line.find('\t');
+    if (t == std::string::npos)
+      continue;
+    size_t t2 = line.find('\t', t + 1);
+    std::string id = line.substr(0, t);
+    std::string s =
+        line.substr(t + 1, t2 == std::string::npos ? t2 : t2 - t - 1);
+    if (!id.empty() && s == ssid)
+      return id;
+  }
+  return "";
+}
+
+void WifiDirectManager::removeBrickDropNetworks() {
+  std::string prefix = Config::kGroupPrefix;
+  std::string list = wpa("list_networks");
+  std::vector<std::string> ids;
+  size_t pos = 0;
+  bool first = true;
+  while (pos < list.size()) {
+    size_t e = list.find('\n', pos);
+    std::string line = list.substr(pos, e == std::string::npos ? e : e - pos);
+    pos = e == std::string::npos ? list.size() : e + 1;
+    if (first) {
+      first = false;
+      continue;
+    }
+    size_t t = line.find('\t');
+    if (t == std::string::npos)
+      continue;
+    size_t t2 = line.find('\t', t + 1);
+    std::string id = line.substr(0, t);
+    std::string s =
+        line.substr(t + 1, t2 == std::string::npos ? t2 : t2 - t - 1);
+    if (!id.empty() && s.compare(0, prefix.size(), prefix) == 0)
+      ids.push_back(id);
+  }
+  for (auto &id : ids)
+    wpa("remove_network " + id);
+  if (!ids.empty())
+    wpa("save_config");
+}
+
+void WifiDirectManager::restoreOriginalWifi(std::string &outMsg) {
+  // 1. Dừng hotspot: hostapd/udhcpd + hạ wlan1.
   exec("killall hostapd 2>/dev/null; killall udhcpd 2>/dev/null");
   exec("ifconfig wlan1 0.0.0.0 down 2>/dev/null; ifconfig wlan1 up");
-  if (m_mode == LinkMode::JOINED)
-    wpa("reconnect");
   m_mode = LinkMode::NONE;
   m_ssid.clear();
-  outMsg = "Đã tắt nhóm offline";
+  // 2. Xóa profile BrickDrop-* đã save_config — nếu không wpa_supplicant
+  //    sẽ tự join lại hotspot BrickDrop → vẫn mất internet.
+  removeBrickDropNetworks();
+  // 3. Về lại WiFi gốc.
+  outMsg = "Đã ngắt hotspot";
+  if (m_origSsid.empty()) {
+    wpa("reconnect"); // không biết gốc: để wpa tự quyết
+    return;
+  }
+  std::string id = findNetworkId(m_origSsid);
+  if (id.empty()) {
+    outMsg = "Đã ngắt hotspot (không thấy WiFi " + m_origSsid + " đã lưu)";
+    return;
+  }
+  wpa("select_network " + id); // chỉ bật đúng mạng gốc + reconnect
+  wpa("save_config");
+  // Chờ kết nối lại (best-effort ~12s; wpa_supplicant vẫn tự thử tiếp
+  // dù hàm này đã trả về).
+  for (int i = 0; i < 12; ++i) {
+    sleep(1);
+    std::string st = wpa("status");
+    if (wpaVal(st, "wpa_state") == "COMPLETED" &&
+        wpaVal(st, "ssid") == m_origSsid) {
+      outMsg = "Đã về lại WiFi: " + m_origSsid;
+      Logger::info("BrickDrop: wifi restored to " + m_origSsid);
+      return;
+    }
+  }
+  outMsg = "Đang kết nối lại WiFi: " + m_origSsid + "...";
+}
+
+bool WifiDirectManager::stopGroup(std::string &outMsg) {
+  // "Ngắt kết nối" = dừng hotspot + về lại internet ngay (điều kiện của Tai).
+  restoreOriginalWifi(outMsg);
   return true;
 }
 
@@ -192,7 +314,7 @@ std::vector<WifiGroup> WifiDirectManager::scanGroups() {
 
 bool WifiDirectManager::joinGroup(const std::string &ssid, std::string &outMsg) {
   if (ssid.empty()) {
-    outMsg = "Chưa chọn nhóm";
+    outMsg = "Chưa chọn hotspot";
     return false;
   }
   // Xóa profile trùng để khỏi đánh nhau.
@@ -248,11 +370,11 @@ bool WifiDirectManager::joinGroup(const std::string &ssid, std::string &outMsg) 
       m_mode = LinkMode::JOINED;
       m_ssid = ssid;
       std::string ip = val("ip_address");
-      outMsg = "Đã vào " + ssid + (ip.empty() ? "" : " (" + ip + ")");
+      outMsg = "Đã kết nối " + ssid + (ip.empty() ? "" : " (" + ip + ")");
       return true;
     }
   }
-  outMsg = "Chưa vào được " + ssid;
+  outMsg = "Kết nối thất bại: " + ssid;
   return false;
 }
 

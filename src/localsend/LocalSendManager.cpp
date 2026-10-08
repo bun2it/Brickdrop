@@ -28,6 +28,7 @@
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 
@@ -90,7 +91,7 @@ bool LocalSendManager::start() {
   m_transferThread = std::thread(&LocalSendManager::transferLoop, this);
 
   Logger::info("LocalSend: started (port " +
-               std::to_string(LocalSendProto::kPort) + ")");
+               std::to_string(LocalSendProto::kServicePort) + ")");
   return true;
 }
 
@@ -312,7 +313,9 @@ int64_t nowMs() {
 std::string makeUuid() { return randomHex(32); }
 
 std::string randomHex(int n) {
-  static std::mt19937_64 rng(
+  // FIX: mt19937_64 khong thread-safe; makeUuid duoc goi tu nhieu thread
+  // (discovery/transfer/sender) -> moi thread dung rng rieng.
+  static thread_local std::mt19937_64 rng(
       std::chrono::steady_clock::now().time_since_epoch().count() ^
       std::hash<std::thread::id>{}(std::this_thread::get_id()));
   std::string out;
@@ -450,6 +453,10 @@ uint64_t sdFreeBytes(const std::string &path) {
 
 } // namespace LsUtil
 
+// Forward: định nghĩa ở dưới (tránh ghi đè file trùng tên: " (2)", ...).
+// Cần cho batch auto-approve trong handlePrepareUpload.
+static std::string uniquePath(const std::string &path);
+
 // =============================================================
 // UDP Discovery
 // =============================================================
@@ -566,30 +573,31 @@ void LocalSendManager::pruneStaleDevices(int64_t maxAgeMs) {
 }
 
 void LocalSendManager::refreshDiscovery() {
-  // Fix rescan mat device: GIU list cu lam cache (khong prune o day),
+  int v = m_visibility.load();
+  if (v == (int)LsVisibility::OFF)
+    return;
+  if (v == (int)LsVisibility::CONTACTS) {
+    // Chỉ gõ cửa máy quen, không multicast.
+    std::thread([this]() { announceToTrusted(); }).detach();
+    return;
+  }
   // dong thoi unicast thang toi cac IP da biet + burst multicast.
   // Ly do: multicast tren nhieu AP/router bi rot goi lan 2 tro di,
   // chi gui multicast thi peer khong nghe thay -> khong reply -> list trang.
   // Unicast toi IP cu thi ti le toi gan nhu 100% -> peer reply ngay.
   std::vector<std::string> cachedIps;
-  std::vector<int> cachedPorts;
   {
     std::lock_guard<std::mutex> lock(m_knownMutex);
     for (auto &d : m_knownDevices) {
-      if (!d.ip.empty()) {
+      if (!d.ip.empty())
         cachedIps.push_back(d.ip);
-        cachedPorts.push_back(d.port);
-      }
     }
   }
-  std::thread([this, cachedIps, cachedPorts]() {
-    // 1. Unicast go thang may quen (kich peer reply unicast ve ngay)
-    for (size_t i = 0; i < cachedIps.size() && m_running; ++i) {
-      int p = (i < cachedPorts.size() && cachedPorts[i] > 0)
-                  ? cachedPorts[i]
-                  : LocalSendProto::kPort;
-      sendUnicastAnnounce(cachedIps[i], p, true);
-    }
+  std::thread([this, cachedIps]() {
+    // 1. Unicast go thang may quen (kich peer reply unicast ve ngay).
+    // FIX: discovery packet tới UDP discovery port chuẩn, không phải TCP port.
+    for (size_t i = 0; i < cachedIps.size() && m_running; ++i)
+      sendUnicastAnnounce(cachedIps[i], LocalSendProto::kPort, true);
     // 2. Burst 3 goi multicast cach nhau 150ms de vuot qua loss WiFi/router
     // chan multicast lan dau — chay nen de khong block UI.
     for (int i = 0; i < 3 && m_running; ++i) {
@@ -614,6 +622,15 @@ void LocalSendManager::handleDiscoveryPacket(const char *json, size_t len,
     return;
   if (fromIp == m_ownIp)
     return;
+  // AirDrop-style: OFF bỏ hết; CONTACTS vẫn NGHE (để cập nhật IP mới của
+  // máy quen) nhưng lờ máy lạ, không reply.
+  {
+    int v = m_visibility.load();
+    if (v == (int)LsVisibility::OFF)
+      return;
+    if (v == (int)LsVisibility::CONTACTS && !isPeerAllowed(dev.fingerprint))
+      return;
+  }
   LsJson::getString(jstr, "version", dev.version);
   LsJson::getString(jstr, "deviceModel", dev.deviceModel);
   LsJson::getString(jstr, "deviceType", dev.deviceType);
@@ -629,7 +646,9 @@ void LocalSendManager::handleDiscoveryPacket(const char *json, size_t len,
   addOrUpdateKnownDevice(dev);
 
   if (dev.announce)
-    sendUnicastAnnounce(dev.ip, dev.port);
+    // FIX: discovery packet luôn gửi tới UDP discovery port chuẩn (53317),
+    // không phải TCP service port mà peer announce (BrickDrop announce 53318).
+    sendUnicastAnnounce(dev.ip, LocalSendProto::kPort);
 }
 
 void LocalSendManager::addOrUpdateKnownDevice(const LsDeviceInfo &dev) {
@@ -660,6 +679,42 @@ void LocalSendManager::clearKnownDevices() {
   m_knownDevices.clear();
 }
 
+void LocalSendManager::setTrustedPeers(const std::vector<LsTrusted> &peers) {
+  std::lock_guard<std::mutex> lock(m_trustMutex);
+  m_trusted = peers;
+}
+
+bool LocalSendManager::isPeerAllowed(const std::string &fp) {
+  int v = m_visibility.load();
+  if (v == (int)LsVisibility::EVERYONE)
+    return true;
+  if (v == (int)LsVisibility::OFF)
+    return false;
+  // CONTACTS: fp phải nằm trong danh bạ. Lưu ý fp do peer tự khai
+  // (spoof được trên LAN) — đây là lọc tiện lợi, không phải xác thực.
+  if (fp.empty())
+    return false;
+  std::lock_guard<std::mutex> lock(m_trustMutex);
+  for (auto &t : m_trusted)
+    if (t.fp == fp)
+      return true;
+  return false;
+}
+
+// CONTACTS: chỉ unicast tới máy tin cậy (không multicast để khỏi lộ diện).
+void LocalSendManager::announceToTrusted() {
+  std::vector<LsTrusted> peers;
+  {
+    std::lock_guard<std::mutex> lock(m_trustMutex);
+    peers = m_trusted;
+  }
+  for (auto &t : peers) {
+    if (!t.ip.empty())
+      // FIX: discovery packet tới UDP discovery port chuẩn, không phải TCP port.
+      sendUnicastAnnounce(t.ip, LocalSendProto::kPort, true);
+  }
+}
+
 // =============================================================
 // buildDeviceInfoJson - dùng cho announce và /info response
 // =============================================================
@@ -672,7 +727,7 @@ std::string DeviceInfoJson(const LocalSendManager &self, bool announce) {
   ss << "\"deviceModel\":\"TrimUI Brick Pro\",";
   ss << "\"deviceType\":\"" << LocalSendProto::kDeviceType << "\",";
   ss << "\"fingerprint\":\"" << self.fingerprint() << "\",";
-  ss << "\"port\":" << LocalSendProto::kPort << ",";
+  ss << "\"port\":" << LocalSendProto::kServicePort << ",";
   ss << "\"protocol\":\"" << LocalSendProto::kProtocol << "\",";
   ss << "\"download\":false,";
   ss << "\"announce\":" << (announce ? "true" : "false");
@@ -700,7 +755,7 @@ bool LocalSendManager::setupTcpSocket() {
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(LocalSendProto::kPort);
+  addr.sin_port = htons(LocalSendProto::kServicePort);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
   if (bind(m_tcpFd, (sockaddr *)&addr, sizeof(addr)) < 0) {
     Logger::error("LocalSend: TCP bind failed: " +
@@ -717,7 +772,7 @@ bool LocalSendManager::setupTcpSocket() {
     return false;
   }
   Logger::info("LocalSend: TCP listening on :" +
-               std::to_string(LocalSendProto::kPort));
+               std::to_string(LocalSendProto::kServicePort));
   return true;
 }
 
@@ -758,7 +813,13 @@ void LocalSendManager::discoveryLoop() {
     auto now = std::chrono::steady_clock::now();
     if (now - lastPing >=
         std::chrono::seconds(LocalSendProto::kDiscoveryPingIntervalSec)) {
-      sendMulticastAnnounce();
+      int v = m_visibility.load();
+      if (v == (int)LsVisibility::EVERYONE) {
+        sendMulticastAnnounce();
+      } else if (v == (int)LsVisibility::CONTACTS) {
+        announceToTrusted();
+      }
+      // OFF: im lặng hoàn toàn.
       lastPing = now;
     }
     // Dọn thiết bị quá 20s không thấy announce + prune prepare quá 60s
@@ -1158,6 +1219,19 @@ bool LocalSendManager::handlePrepareUpload(int fd, const std::string &body,
   LsJson::getString(fileObj, "gameTitle", req.file.gameTitle);
   LsJson::getString(fileObj, "coverPath", req.file.coverPath);
 
+  // Batch: gửi cả thư mục (mở rộng BrickDrop) — duyệt 1 lần cho cả batch.
+  LsJson::getString(fileObj, "batchId", req.file.batchId);
+  {
+    uint64_t u64 = 0;
+    if (LsJson::getUint64(fileObj, "batchIndex", u64))
+      req.file.batchIndex = (int)u64;
+    if (LsJson::getUint64(fileObj, "batchTotal", u64))
+      req.file.batchTotal = (int)u64;
+    if (LsJson::getUint64(fileObj, "batchSize", u64))
+      req.file.batchSize = u64;
+  }
+  LsJson::getString(fileObj, "batchName", req.file.batchName);
+
   if (req.file.id.empty())
     req.file.id = req.fileId;
 
@@ -1174,6 +1248,46 @@ bool LocalSendManager::handlePrepareUpload(int fd, const std::string &body,
   }
   req.savedPath = target;
   req.fileToken = LsUtil::makeUuid();
+
+  // Batch (gửi cả thư mục): nếu batch này đã có quyết định duyệt/từ chối
+  // từ file đầu → áp luôn, không hiện modal từng file.
+  if (!req.file.batchId.empty()) {
+    int dec = batchDecision(fromIp, req.file.batchId);
+    if (dec != 0) {
+      if (dec > 0) {
+        // Tự duyệt: dựng req APPROVED, push m_pending, trả 200 ngay
+        // (không qua m_preparing/user prompt).
+        LsUploadRequest areq;
+        areq.sessionId = req.sessionId;
+        areq.fileId = req.fileId;
+        areq.fileToken = req.fileToken;
+        areq.fromAlias = req.fromAlias;
+        areq.fromIp = fromIp;
+        areq.file = req.file;
+        areq.lastUpdateMs = LsUtil::nowMs();
+        areq.state = LsUploadRequest::APPROVED;
+        areq.savedPath = uniquePath(target);
+        {
+          std::lock_guard<std::mutex> lock(m_pendingMutex);
+          if ((int)m_pending.size() >= LocalSendProto::kMaxPendingRequests)
+            m_pending.erase(m_pending.begin());
+          m_pending.push_back(areq);
+        }
+        std::ostringstream ss;
+        ss << "{\"sessionId\":\"" << req.sessionId << "\",\"files\":{"
+           << "\"" << LsJson::escape(req.fileId) << "\":\""
+           << req.fileToken << "\"}}";
+        sendJsonResponse(fd, 200, ss.str());
+        Logger::info("LocalSend: batch auto-approved " + req.file.fileName +
+                     " (" + std::to_string(req.file.batchIndex) + "/" +
+                     std::to_string(req.file.batchTotal) + ")");
+      } else {
+        sendJsonResponse(fd, 403, "{\"error\":\"rejected by user\"}");
+        Logger::info("LocalSend: batch auto-rejected " + req.file.fileName);
+      }
+      return true; // đã respond, caller đóng fd
+    }
+  }
 
   // Hold socket response and save into m_preparing
   LsPendingPrepare pp;
@@ -1234,24 +1348,46 @@ void LocalSendManager::handleFileUpload(
 
   // Spec §4.2: client Flutter/Localsend gửi token từ prepare-upload.
   // RomCloud-to-RomCloud cũng gửi token (sender parse files[fileId]).
-  int reqIdx = -1;
+  // FIX: khong giu index vao m_pending — vector co the bi erase tu thread khac
+  // (approve/handleCancel/clearFinishedTasks) trong luc cho user duyet.
+  // Lookup lai theo sessionId+fileId moi lan truy cap.
+  auto getState = [&]() -> LsUploadRequest::State {
+    std::lock_guard<std::mutex> lock(m_pendingMutex);
+    for (const auto &r : m_pending)
+      if (r.sessionId == sessionId && r.fileId == fileId)
+        return r.state;
+    return LsUploadRequest::FAILED; // session da bi xoa -> coi nhu fail
+  };
+  auto setState = [&](LsUploadRequest::State s) {
+    std::lock_guard<std::mutex> lock(m_pendingMutex);
+    for (auto &r : m_pending)
+      if (r.sessionId == sessionId && r.fileId == fileId) {
+        r.state = s;
+        return;
+      }
+  };
+  auto getCopy = [&]() -> LsUploadRequest {
+    std::lock_guard<std::mutex> lock(m_pendingMutex);
+    for (const auto &r : m_pending)
+      if (r.sessionId == sessionId && r.fileId == fileId)
+        return r;
+    return LsUploadRequest{};
+  };
   {
     std::lock_guard<std::mutex> lock(m_pendingMutex);
-    for (size_t i = 0; i < m_pending.size(); ++i) {
-      auto &r = m_pending[i];
+    bool found = false;
+    for (const auto &r : m_pending)
       if (r.sessionId == sessionId && r.fileId == fileId) {
-        reqIdx = (int)i;
+        found = true;
         break;
       }
+    if (!found) {
+      sendJsonResponse(fd, 404, "{\"error\":\"unknown session\"}");
+      return;
     }
   }
-  if (reqIdx < 0) {
-    sendJsonResponse(fd, 404, "{\"error\":\"unknown session\"}");
-    return;
-  }
   {
-    std::lock_guard<std::mutex> lock(m_pendingMutex);
-    LsUploadRequest &r = m_pending[(size_t)reqIdx];
+    LsUploadRequest r = getCopy();
     // Chấp nhận cả client cũ không gửi token, nhưng nếu pending có token
     // mà client gửi token sai → 403 (tránh nhầm session).
     if (!r.fileToken.empty() && !token.empty() && r.fileToken != token) {
@@ -1259,16 +1395,6 @@ void LocalSendManager::handleFileUpload(
       return;
     }
   }
-  // Dùng index (không giữ raw pointer) vì m_pending có thể push thêm
-  // từ connection khác gây reallocate vector trong lúc chờ approve.
-  auto getState = [&]() -> LsUploadRequest::State {
-    std::lock_guard<std::mutex> lock(m_pendingMutex);
-    return m_pending[(size_t)reqIdx].state;
-  };
-  auto setState = [&](LsUploadRequest::State s) {
-    std::lock_guard<std::mutex> lock(m_pendingMutex);
-    m_pending[(size_t)reqIdx].state = s;
-  };
 
   // Đợi user approve (poll 200ms, tối đa 60s)
   const int maxWait = LocalSendProto::kUploadApprovalTimeoutSec * 5;
@@ -1280,6 +1406,8 @@ void LocalSendManager::handleFileUpload(
       sendJsonResponse(fd, 403, "{\"error\":\"rejected\"}");
       return;
     }
+    if (s == LsUploadRequest::FAILED)
+      break; // session bi xoa giua chung (cancel/clear) -> thoat nhanh
     if (!m_running) {
       sendJsonResponse(fd, 503, "{\"error\":\"shutting down\"}");
       return;
@@ -1297,11 +1425,11 @@ void LocalSendManager::handleFileUpload(
   std::string wantName;
   uint64_t wantSize = 0;
   {
-    std::lock_guard<std::mutex> lock(m_pendingMutex);
-    savedPath = m_pending[(size_t)reqIdx].savedPath;
-    wantSha = m_pending[(size_t)reqIdx].file.sha256;
-    wantName = m_pending[(size_t)reqIdx].file.fileName;
-    wantSize = m_pending[(size_t)reqIdx].file.size;
+    LsUploadRequest meta = getCopy();
+    savedPath = meta.savedPath;
+    wantSha = meta.file.sha256;
+    wantName = meta.file.fileName;
+    wantSize = meta.file.size;
   }
 
   if (!LsUtil::mkdirRecursive(LsUtil::dirnameOf(savedPath))) {
@@ -1317,11 +1445,7 @@ void LocalSendManager::handleFileUpload(
       Logger::warn("LocalSend: not enough space for " + wantName + " need=" +
                    std::to_string(wantSize) + " free=" + std::to_string(freeB));
       setState(LsUploadRequest::FAILED);
-      LsUploadRequest snap;
-      {
-        std::lock_guard<std::mutex> lock(m_pendingMutex);
-        snap = m_pending[(size_t)reqIdx];
-      }
+      LsUploadRequest snap = getCopy();
       std::lock_guard<std::mutex> lock(m_cbMutex);
       if (m_onComplete)
         m_onComplete(snap);
@@ -1365,10 +1489,15 @@ void LocalSendManager::handleFileUpload(
     LsUploadRequest snap;
     {
       std::lock_guard<std::mutex> lock(m_pendingMutex);
-      m_pending[(size_t)reqIdx].receivedBytes = totalRead;
-      m_pending[(size_t)reqIdx].bytesPerSec = bps;
-      m_pending[(size_t)reqIdx].lastUpdateMs = now;
-      snap = m_pending[(size_t)reqIdx];
+      for (auto &r : m_pending) {
+        if (r.sessionId == sessionId && r.fileId == fileId) {
+          r.receivedBytes = totalRead;
+          r.bytesPerSec = bps;
+          r.lastUpdateMs = now;
+          snap = r;
+          break;
+        }
+      }
     }
     lastTickMs = now;
     lastTickBytes = totalRead;
@@ -1434,11 +1563,7 @@ void LocalSendManager::handleFileUpload(
                  " expected=" + std::to_string(expectedLen));
     ::unlink(savedPath.c_str());
     setState(LsUploadRequest::FAILED);
-    LsUploadRequest snap;
-    {
-      std::lock_guard<std::mutex> lock(m_pendingMutex);
-      snap = m_pending[(size_t)reqIdx];
-    }
+    LsUploadRequest snap = getCopy();
     std::lock_guard<std::mutex> lock(m_cbMutex);
     if (m_onComplete)
       m_onComplete(snap);
@@ -1459,11 +1584,7 @@ void LocalSendManager::handleFileUpload(
       Logger::warn("LocalSend: SHA256 mismatch for " + wantName);
       ::unlink(savedPath.c_str());
       setState(LsUploadRequest::FAILED);
-      LsUploadRequest snap;
-      {
-        std::lock_guard<std::mutex> lock(m_pendingMutex);
-        snap = m_pending[(size_t)reqIdx];
-      }
+      LsUploadRequest snap = getCopy();
       std::lock_guard<std::mutex> lock(m_cbMutex);
       if (m_onComplete)
         m_onComplete(snap);
@@ -1476,11 +1597,7 @@ void LocalSendManager::handleFileUpload(
   Logger::info("LocalSend: received " + wantName + " (" +
                std::to_string(totalRead) + " bytes) -> " + savedPath);
 
-  LsUploadRequest snapshot;
-  {
-    std::lock_guard<std::mutex> lock(m_pendingMutex);
-    snapshot = m_pending[(size_t)reqIdx];
-  }
+  LsUploadRequest snapshot = getCopy();
   {
     std::lock_guard<std::mutex> lock(m_cbMutex);
     if (m_onComplete)
@@ -1511,9 +1628,12 @@ void LocalSendManager::handleCancel(int fd, const std::string &query) {
     std::lock_guard<std::mutex> lock(m_pendingMutex);
     for (auto &r : m_pending) {
       if (r.sessionId == sessionId) {
-        r.state = LsUploadRequest::FAILED;
-        if (!r.savedPath.empty())
-          ::unlink(r.savedPath.c_str());
+        // FIX: cancel den muon (transfer da DONE) khong duoc xoa file da nhan.
+        if (r.state != LsUploadRequest::DONE) {
+          r.state = LsUploadRequest::FAILED;
+          if (!r.savedPath.empty())
+            ::unlink(r.savedPath.c_str());
+        }
         break;
       }
     }
@@ -1535,6 +1655,57 @@ void LocalSendManager::handleCancel(int fd, const std::string &query) {
 // =============================================================
 // approve/reject từ UI
 // =============================================================
+// FIX: tranh ghi de file trung ten khi nhan — tu dong them " (2)", " (3)", ...
+// Dat truoc extension de file van mo duoc (vd "game (2).zip").
+static std::string uniquePath(const std::string &path) {
+  if (access(path.c_str(), F_OK) != 0)
+    return path;
+  std::string dir = LsUtil::dirnameOf(path);
+  std::string base = LsUtil::basenameOf(path);
+  std::string stem = base, ext;
+  size_t dot = base.find_last_of('.');
+  if (dot != std::string::npos && dot != 0) {
+    stem = base.substr(0, dot);
+    ext = base.substr(dot);
+  }
+  for (int i = 2;; ++i) {
+    std::string cand = dir + "/" + stem + " (" + std::to_string(i) + ")" + ext;
+    if (access(cand.c_str(), F_OK) != 0)
+      return cand;
+  }
+}
+
+// =============================================================
+// Batch (gửi cả thư mục): quyết định 1 lần cho cả batch
+// =============================================================
+void LocalSendManager::recordBatchDecision(const std::string &fromIp,
+                                           const std::string &batchId,
+                                           bool approved) {
+  if (batchId.empty() || fromIp.empty())
+    return;
+  std::lock_guard<std::mutex> lock(m_batchMutex);
+  int64_t now = LsUtil::nowMs();
+  // Dọn entry quá 30 phút (tránh map phình vô hạn).
+  for (auto it = m_batchDecisions.begin(); it != m_batchDecisions.end();) {
+    if (now - it->second.second > 30 * 60 * 1000)
+      it = m_batchDecisions.erase(it);
+    else
+      ++it;
+  }
+  m_batchDecisions[fromIp + "/" + batchId] = {approved, now};
+}
+
+int LocalSendManager::batchDecision(const std::string &fromIp,
+                                    const std::string &batchId) {
+  if (batchId.empty() || fromIp.empty())
+    return 0;
+  std::lock_guard<std::mutex> lock(m_batchMutex);
+  auto it = m_batchDecisions.find(fromIp + "/" + batchId);
+  if (it == m_batchDecisions.end())
+    return 0;
+  return it->second.first ? 1 : -1;
+}
+
 void LocalSendManager::approveUpload(const std::string &sessionId) {
   std::string defaultPath;
   {
@@ -1584,13 +1755,16 @@ void LocalSendManager::approveUploadWithPath(const std::string &sessionId,
 
         std::string base = LsUtil::basenameOf(req.file.fileName);
         if (base.empty()) base = req.file.id;
-        std::string destDir = savePath.empty() ? it->savePath : savePath;
+        // FIX: it->savePath vua duoc gan = savePath o tren nen ternary cu vo nghia.
+        std::string destDir = savePath;
         while (destDir.size() > 1 && destDir.back() == '/') destDir.pop_back();
         if (destDir.size() >= base.size() && destDir.substr(destDir.size() - base.size()) == base) {
           req.savedPath = destDir;
         } else {
           req.savedPath = destDir + "/" + base;
         }
+        // FIX: tranh ghi de file trung ten — tu them " (2)", " (3)", ...
+        req.savedPath = uniquePath(req.savedPath);
 
         m_preparing.erase(it);
         found = true;
@@ -1603,6 +1777,9 @@ void LocalSendManager::approveUploadWithPath(const std::string &sessionId,
     Logger::warn("LocalSend: approveUploadWithPath session not found: " + sessionId);
     return;
   }
+
+  // Batch: ghi nhận duyệt cho cả batch (các file sau tự duyệt, khỏi modal).
+  recordBatchDecision(req.fromIp, req.file.batchId, true);
 
   if (clientFd >= 0) {
     std::ostringstream ss;
@@ -1625,16 +1802,21 @@ void LocalSendManager::approveUploadWithPath(const std::string &sessionId,
 
 void LocalSendManager::rejectUpload(const std::string &sessionId) {
   int clientFd = -1;
+  std::string rejIp, rejBatch;
   {
     std::lock_guard<std::mutex> lock(m_prepareMutex);
     for (auto it = m_preparing.begin(); it != m_preparing.end(); ++it) {
       if (it->sessionId == sessionId) {
         clientFd = it->clientFd;
+        rejIp = it->fromIp;
+        rejBatch = it->file.batchId;
         m_preparing.erase(it);
         break;
       }
     }
   }
+  // Batch: ghi nhận từ chối cho cả batch (các file sau tự từ chối).
+  recordBatchDecision(rejIp, rejBatch, false);
   if (clientFd >= 0) {
     sendJsonResponse(clientFd, 403, "{\"error\":\"rejected by user\"}");
     closeSocket(clientFd);
@@ -1839,24 +2021,21 @@ std::string LocalSendManager::resolveTargetPath(const LsFileMeta &file) {
 
   std::string target;
 
-  // Tier 1: user-chosen target folder (highest priority)
+  // Tier 1: thư mục nhận do user chốt = ROOT cho mọi thứ nhận về.
+  std::string rootDir;
   {
     std::lock_guard<std::mutex> lock(m_targetMutex);
-    if (!m_targetFolder.empty()) {
-      std::string dir = normalizeRel(m_targetFolder, true);
-      if (!dir.empty())
-        target = LsUtil::sdRoot() + "/" + dir + base;
-    }
+    if (!m_targetFolder.empty())
+      rootDir = normalizeRel(m_targetFolder, true);
   }
 
-  // Tier 2: relativePath từ sender (RomCloud sender) — giữ đúng path gửi tới
-  if (target.empty() && !file.relativePath.empty()) {
-    std::string dir = normalizeRel(file.relativePath, true);
-    if (!dir.empty())
-      target = LsUtil::sdRoot() + "/" + dir + base;
-    else
-      target = LsUtil::sdRoot() + "/Inbox/" + base;
-  }
+  // Tier 2: relativePath từ sender → LỒNG DƯỚI rootDir, giữ cấu trúc thư mục
+  // (gửi cả folder). Trước đây target folder override làm mất cấu trúc.
+  std::string sub;
+  if (!file.relativePath.empty())
+    sub = normalizeRel(file.relativePath, true);
+  if (!rootDir.empty() || !sub.empty())
+    target = LsUtil::sdRoot() + "/" + rootDir + sub + base;
 
   // Tier 3: fileName có '/' (sender encode path vào fileName)
   if (target.empty() && file.fileName.find('/') != std::string::npos) {
@@ -1925,12 +2104,10 @@ std::string LocalSendManager::heuristicMap(const std::string &fileName) {
       {{".cfg", ".cht", ".opt", ".lpl", ".rpx"}, "RetroArch/", false},
       // BIOS
       {{".bin"}, "RetroArch/system/", false},
-      // Archives (zip cần extract)
-      {{".zip"}, "Inbox/", true},
       // Media
-      {{".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}, "Inbox/", false},
-      {{".mp4", ".mkv", ".avi", ".mov", ".webm"}, "Imgs/", false},
-      {{".mp3", ".ogg", ".wav", ".flac", ".opus"}, "Imgs/", false},
+      {{".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}, "Imgs/", false},
+      {{".mp4", ".mkv", ".avi", ".mov", ".webm"}, "Videos/", false},
+      {{".mp3", ".ogg", ".wav", ".flac", ".opus"}, "Music/", false},
       {{".txt", ".md", ".pdf", ".epub"}, "Books/", false},
       {{".json", ".xml", ".yml", ".yaml", ".conf"}, "RetroArch/", false},
       // Default
@@ -1961,9 +2138,23 @@ void LocalSendManager::postProcessUpload(const LsUploadRequest &req) {
     return;
   Logger::info("BrickDrop: received " + req.savedPath);
   if (LsUtil::lowerExt(req.savedPath) == ".zip") {
-    std::string cmd = "unzip -o -qq '" + req.savedPath + "' -d '" +
-                      LsUtil::dirnameOf(req.savedPath) + "'";
-    int rc = std::system(cmd.c_str());
+    // FIX (RCE): savedPath chua ten file do sender kiem soat — khong bao gio
+    // dua vao shell. Dung fork+exec de goi unzip truc tiep, khong qua /bin/sh.
+    std::string dir = LsUtil::dirnameOf(req.savedPath);
+    pid_t pid = fork();
+    if (pid < 0) {
+      Logger::warn("BrickDrop: unzip fork failed");
+      return;
+    }
+    if (pid == 0) {
+      execlp("unzip", "unzip", "-o", "-qq", req.savedPath.c_str(), "-d",
+             dir.c_str(), (char *)nullptr);
+      _exit(127); // execlp that bai
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    int rc = (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     if (rc == 0) {
       ::unlink(req.savedPath.c_str());
       Logger::info("BrickDrop: unzipped " + req.savedPath);
@@ -2188,17 +2379,13 @@ std::string LocalSendManager::sendFileMeta(const LsFileMeta &inMeta,
     return "";
   }
 
-  LsFileMeta meta = inMeta; // copy để có thể fill size
-  meta.fileName = LsUtil::basenameOf(absPath);
-  meta.size = (uint64_t)st.st_size;
-
   auto prog = std::make_shared<LsSendProgress>();
   prog->sessionId = LsUtil::makeUuid();
   prog->toAlias = target.alias;
   prog->toIp = target.ip;
-  prog->fileName = meta.fileName;
+  prog->fileName = LsUtil::basenameOf(absPath);
   prog->absPath = absPath;
-  prog->totalBytes = meta.size;
+  prog->totalBytes = (uint64_t)st.st_size;
   prog->state = LsSendProgress::NEGOTIATING;
 
   {
@@ -2208,16 +2395,21 @@ std::string LocalSendManager::sendFileMeta(const LsFileMeta &inMeta,
     m_sends.push_back(prog);
   }
 
-  // Build relativePath từ /mnt/SDCARD/ (chỉ khi meta chưa có)
-  if (meta.relativePath.empty()) {
-    const std::string prefix = "/mnt/SDCARD/";
-    if (absPath.compare(0, prefix.size(), prefix) == 0) {
-      std::string sub = absPath.substr(prefix.size());
-      auto slash = sub.find_last_of('/');
-      meta.relativePath =
-          (slash == std::string::npos) ? "" : sub.substr(0, slash + 1);
-    }
-  }
+  return sendFileMetaWithProgress(inMeta, absPath, target, prog);
+}
+
+// Worker chung cho sendFileMeta (sync) va sendFileMetaAsync (nen):
+// prog da duoc tao va push vao m_sends truoc — khong tao moi o day.
+std::string LocalSendManager::sendFileMetaWithProgress(
+    const LsFileMeta &inMeta, const std::string &absPath,
+    const LsDeviceInfo &target, std::shared_ptr<LsSendProgress> prog) {
+  prog->state = LsSendProgress::NEGOTIATING;
+  LsFileMeta meta = inMeta; // copy để có thể fill size
+  meta.fileName = LsUtil::basenameOf(absPath);
+  meta.size = prog->totalBytes;
+  // Không tự build relativePath nữa: file lẻ giữ phẳng trong thư mục nhận
+  // (như AirDrop); chỉ khi gửi cả folder mới set relativePath tường minh
+  // để receiver dựng lại cấu trúc.
 
   // Build fileId
   std::string fileId = LsUtil::makeUuid();
@@ -2268,6 +2460,18 @@ std::string LocalSendManager::sendFileMeta(const LsFileMeta &inMeta,
       prep << "\"gameTitle\":\"" << LsJson::escape(meta.gameTitle) << "\",";
     if (!meta.coverPath.empty())
       prep << "\"coverPath\":\"" << LsJson::escape(meta.coverPath) << "\",";
+  }
+
+  // Batch: gửi cả thư mục — receiver duyệt 1 lần cho cả batch.
+  if (!meta.batchId.empty()) {
+    prep << "\"batchId\":\"" << LsJson::escape(meta.batchId) << "\",";
+    prep << "\"batchIndex\":" << meta.batchIndex << ",";
+    prep << "\"batchTotal\":" << meta.batchTotal << ",";
+    if (meta.batchSize > 0)
+      prep << "\"batchSize\":" << meta.batchSize << ",";
+    if (!meta.batchName.empty())
+      prep << "\"batchName\":\"" << LsJson::escape(meta.batchName)
+           << "\",";
   }
 
   // Cắt dấu phẩy cuối cùng nếu có
@@ -2329,22 +2533,44 @@ std::string LocalSendManager::sendFileMeta(const LsFileMeta &inMeta,
   return prog->sessionId;
 }
 
-std::string LocalSendManager::sendFileMetaAsync(const LsFileMeta &inMeta,
-                                                const std::string &absPath,
-                                                const LsDeviceInfo &target) {
+std::shared_ptr<LsSendProgress>
+LocalSendManager::sendFileMetaAsync(const LsFileMeta &inMeta,
+                                    const std::string &absPath,
+                                    const LsDeviceInfo &target) {
   if (!m_running)
-    return "";
+    return nullptr;
   if (absPath.empty() || absPath[0] != '/' || !LsUtil::isPathSafe(absPath))
-    return "";
+    return nullptr;
+
+  // FIX: tao LsSendProgress that NGAY (state QUEUED) va tra ve handle cho caller,
+  // thay vi token string "queued-uuid" mo coi khong map duoc voi progress that.
+  struct stat st{};
+  if (stat(absPath.c_str(), &st) != 0) {
+    Logger::warn("LocalSend: sendFileMetaAsync stat failed: " + absPath);
+    return nullptr;
+  }
+  auto prog = std::make_shared<LsSendProgress>();
+  prog->sessionId = LsUtil::makeUuid();
+  prog->toAlias = target.alias;
+  prog->toIp = target.ip;
+  prog->fileName = LsUtil::basenameOf(absPath);
+  prog->absPath = absPath;
+  prog->totalBytes = (uint64_t)st.st_size;
+  prog->state = LsSendProgress::QUEUED;
+  {
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (m_sends.size() >= 16)
+      m_sends.erase(m_sends.begin());
+    m_sends.push_back(prog);
+  }
+
+  // Chay nen: worker dung chung prog da tao san; tra ve ngay de UI
+  // chuyen sang PROGRESS va theo doi truc tiep qua handle.
   LsFileMeta metaCopy = inMeta;
-  std::string token = "queued-" + LsUtil::makeUuid();
-  // Chay nen: sendFileMeta (sync) se tu tao LsSendProgress that trong m_sends.
-  // Tra ve ngay de UI chuyen sang PROGRESS va poll
-  // sendProgresses()/receiveProgresses().
-  std::thread([this, metaCopy, absPath, target]() {
-    this->sendFileMeta(metaCopy, absPath, target);
+  std::thread([this, metaCopy, absPath, target, prog]() {
+    this->sendFileMetaWithProgress(metaCopy, absPath, target, prog);
   }).detach();
-  return token;
+  return prog;
 }
 
 std::vector<LsSendProgress> LocalSendManager::sendProgresses() {

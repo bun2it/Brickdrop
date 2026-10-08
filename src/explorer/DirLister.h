@@ -37,6 +37,8 @@ public:
   void setSelected(int i) { m_sel = i; }
 
   static std::string humanSize(uint64_t bytes);
+  // Dung lượng trống (bytes) của filesystem chứa path. 0 nếu lỗi.
+  static uint64_t diskFree(const std::string &path);
 
 private:
   std::string m_path = "/";

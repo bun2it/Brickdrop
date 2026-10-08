@@ -19,6 +19,13 @@ namespace BrickDrop {
 // ----- Protocol constants (spec §1) -----------------------------------
 namespace LocalSendProto {
 constexpr int kPort = 53317;
+// FIX tranh chấp port với RomCloud (cùng chạy LocalSend trên 1 máy):
+// - kPort (53317): GIỮ NGUYÊN cho discovery (multicast + UDP unicast). Đây là
+//   port chuẩn của protocol, mọi implementation đều nghe ở đây; UDP có
+//   SO_REUSEADDR nên 2 app chung máy vẫn cùng nhận multicast được.
+// - kServicePort (53318): TCP listen + port ghi trong announce/info của
+//   BrickDrop. Peer (kể cả app LocalSend gốc) dùng port này cho HTTP.
+constexpr int kServicePort = 53318;
 constexpr const char* kMulticastAddr = "224.0.0.167";
 constexpr const char* kVersion = "2.0";
 constexpr const char* kDeviceType = "mobile";
@@ -55,6 +62,14 @@ struct LsFileMeta {
     std::string fileType;
     std::string sha256;
     std::string preview;
+    // ----- Batch: gửi cả thư mục (mở rộng BrickDrop) ------------------
+    // Nhiều session 1-file chung batchId: receiver duyệt/từ chối 1 lần cho
+    // cả batch, các file sau tự theo quyết định đầu (khỏi N popup).
+    std::string batchId;    // "" = không batch
+    int batchIndex = 0;     // 1-based
+    int batchTotal = 0;
+    uint64_t batchSize = 0; // tổng bytes cả batch (hiển thị khi duyệt)
+    std::string batchName;  // tên thư mục
     // ----- MỞ RỘNG RomCloud: nếu file là 1 game trong DB ------------
     // Cho phép sender truyền kèm metadata game (title, system, cover path)
     // → receiver render dialog duyệt với cover art + tên game đẹp.

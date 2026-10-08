@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 namespace BrickDrop {
@@ -135,6 +136,13 @@ std::string DirLister::humanSize(uint64_t bytes) {
   char buf[32];
   snprintf(buf, sizeof(buf), "%.1f %s", v, u[i]);
   return buf;
+}
+
+uint64_t DirLister::diskFree(const std::string &path) {
+  struct statvfs sv;
+  if (statvfs(path.c_str(), &sv) != 0)
+    return 0;
+  return (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
 }
 
 } // namespace BrickDrop

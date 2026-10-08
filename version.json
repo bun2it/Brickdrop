@@ -1,0 +1,7 @@
+{
+  "version": "0.1",
+  "release_date": "2026-10-08",
+  "full_zip_url": "https://github.com/bun2it/Brickdrop/releases/download/v0.1/BrickDrop-v0.1.zip",
+  "sha256": "be8e0cae14e1e3551a2b294ceaea80b13336aab65b70d1c99cdd1df7b8db18b7",
+  "changelog": "Bản beta đầu tiên: gửi file và thư mục giữa các máy Brick Pro, không cần mạng."
+}
